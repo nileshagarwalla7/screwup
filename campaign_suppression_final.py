@@ -80,7 +80,7 @@ def suppressCustomersBasedOnBusinessRules(dfTravelers):
 	
 def code_completion_email(body,subject,pos,locale_name):
 	fromaddr = "expedia_notifications@affineanalytics.com"
-	toaddr = ["nilesh.agarwalla@affineanalytics.com"]
+	toaddr = ["alphaalerts@expedia.com"]
 	toaddress = ", ".join(toaddr)
 	msg = MIMEMultipart()
 	msg['From'] = fromaddr
@@ -97,7 +97,7 @@ def code_completion_email(body,subject,pos,locale_name):
 	server.quit()
 	print ("Code Completion mail triggered successfully")
 	return "1"
-	
+
 
 AlphaStartDate = get_pst_date()
 print("AlphaStartDate = ",AlphaStartDate)
@@ -157,11 +157,13 @@ try :
 	parser.add_argument("--test_type", help="AUTOTEST or MANUAL or BACKUP OR XYZ")
 	parser.add_argument("--campaign_id", help="Campaign ID or Null")
 	parser.add_argument("--email_address", help="Enter email address")
+	parser.add_argument("--cpgn_type", help="Enter marketing or loyalty")
 
 	args = parser.parse_args()
 	locale_name = args.locale_name
 	job_type = args.job_type
 	env_type = args.env_type
+	cpgn_type = args.cpgn_type
 	
 	if job_type == 'test':
 		run_date = args.run_date
@@ -187,8 +189,10 @@ try :
 	properties = {"user" : "occuser" , "password":"Exp3dia22" , "driver":"com.microsoft.sqlserver.jdbc.SQLServerDriver"}
 	if env_type == 'prod':
 		url = "jdbc:sqlserver://10.23.18.135"
+		ocelotDb = "AlphaProd"
 	else:
 		url = "jdbc:sqlserver://10.23.16.35"
+		ocelotDb = "AlphaTest"
 	
 	severName = sc.broadcast(url)
 	severProperties = sc.broadcast(properties)
@@ -260,10 +264,10 @@ print("LaunchDate = " + str(LaunchDate))
 	
 StartDate = get_pst_date() #pacific standard time
 
-tableName = ['segment_module','module_variable_definition','segment_definition','module_definition']
+tableName = ['module_variable_definition','module_definition']
 
 ### Table names for the newly created views					
-tableName_view = ['vwCampaignDefinition','vwTemplateDefinition']
+tableName_view = ['vwCampaignDefinition','vwTemplateDefinition','vwSegmentDefinition','vwSegmentModule']
 
 #writing the different tables in 'df'+tableName format
 try :
@@ -290,20 +294,83 @@ except:
 	raise Exception("Campaign meta data not present!!!")
 
 ### Joining with manual launch table to filter campaigns launched using backup	
-	
-if env_type == 'prod':
-    dfManualLaunch = (importSQLTable("AlphaProd","ManualLaunch"))
 
-else:
-    dfManualLaunch = (importSQLTable("AlphaTest","ManualLaunch"))
- 
+dfManualLaunch = (importSQLTable(ocelotDb,"ManualLaunch"))	
 
 dfCampaignlaunched=dfManualLaunch.filter("locale='{}'".format(locale_name)).filter("LaunchDate='{}'".format(LaunchDate)).distinct() 
+if(cpgn_type=='loyalty'):
+	dfCampaignDefinition = dfCampaignDefinition.filter("locale = '{}' and LaunchDate = '{}'".format(locale_name,LaunchDate)).filter("campaign_deleted_flag = 0").filter("program_type='MR.CUSTOMMAILMERCH.MERCHREWARDSMONTHLYSTATEMENT.GENERIC'")
 
-dfCampaignDefinition = dfCampaignDefinition.filter("locale = '{}' and LaunchDate = '{}'".format(locale_name,LaunchDate)).filter("campaign_deleted_flag = 0")
+else:
+	dfCampaignDefinition = dfCampaignDefinition.filter("locale = '{}' and LaunchDate = '{}'".format(locale_name,LaunchDate)).filter("campaign_deleted_flag = 0")
+
 
 dfCampaignDefinition = dfCampaignDefinition.join(dfCampaignlaunched, dfCampaignDefinition.campaign_id == dfCampaignlaunched.campaign_id, 'leftanti')
-dfCampaignDefinition = dfCampaignDefinition.filter("campaign_id = 20")
+
+### Outer Segments Check
+
+### Joining the campaign definition view to the segment definition view and filtering for segment_deleted_flag = 0 to find out all the active external segments
+
+StartDate = get_pst_date()
+
+try:
+
+    dfCampaignDefinition1=(dfCampaignDefinition.withColumnRenamed("campaign_segment_type_id","segment_type_id")
+                            .join(dfSegmentDefinition,["tpid","eapid","segment_type_id"],'inner')
+                            .filter("segment_deleted_flag=0"))
+    
+    ### Finding out a list of segments which are there in the campaign definition view but which are not active i.e. which have been deleted
+    
+    CampaignDefinitionSegments=set(dfCampaignDefinition.select("campaign_segment_type_id").distinct().rdd.flatMap(lambda x: x).collect())
+    ActiveSegments=set(dfCampaignDefinition1.select("segment_type_id").distinct().rdd.flatMap(lambda x: x).collect())
+    list_deletedSegments=list(CampaignDefinitionSegments-ActiveSegments)
+
+    if (len(list_deletedSegments)!=0):
+    
+        
+        campaignsToSuppress=(dfCampaignDefinition.filter(dfCampaignDefinition["campaign_segment_type_id"].isin(list_deletedSegments))
+                                                    .select("campaign_id").distinct().rdd.flatMap(lambda x: x).collect())
+        
+
+    
+        ### Changing the campaign priority to 9999 for those campaigns whose segments are not active
+        
+        def changepriority(campaign_segment_type_id,priority):
+            if int(campaign_segment_type_id) in list_deletedSegments:
+                newpriority=9999
+            else:
+                newpriority=priority
+                
+            return newpriority
+                
+                
+        changepriorityudf=udf(changepriority,IntegerType())
+        
+        dfCampaignDefinition=(dfCampaignDefinition.withColumn("newpriority",changepriorityudf('campaign_segment_type_id','priority'))
+                                .drop("priority")
+                                .withColumnRenamed("newpriority","priority"))
+    
+        print("The outer segments not present in the segment definition view are",list_deletedSegments)
+        print("WARNING! THESE CAMPAIGNS WILL BE SUPPRESSED {}".format(str(campaignsToSuppress)))
+        log_df_update(sqlContext,1,'Missing outer segments, campaigns to be suppressed {} '.format(str(campaignsToSuppress)),get_pst_date()," ",'0',StartDate,' ',AlphaProcessDetailsLog_str)
+    
+
+                           
+    
+        
+    else:
+        print("No outer segments are missing from the segment definition view")
+        log_df_update(sqlContext,1,'No outer segments are missing from the segment definition view',get_pst_date()," ",'0',StartDate,' ',AlphaProcessDetailsLog_str)
+
+                            
+except:
+
+    log_df_update(sqlContext,0,'Error in outer segments check',get_pst_date(),' ','0',StartDate,' ',AlphaProcessDetailsLog_str)
+    log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
+    log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
+    code_completion_email("failed due to error in outer segments check","Alpha process update for "+locale_name,pos,locale_name)
+    raise Exception("Error in Outer Segments Check!!!")
+
 
 StartDate = get_pst_date()
 
@@ -368,8 +435,14 @@ clt1 = central_log_table.filter(central_log_table.SourceID == central_log_status
 detailed_log_list = clt1.collect()[0] 
 #print (detailed_log_list)
 log_id = detailed_log_list['LogID']
-File_path = detailed_log_list['FilePath']
-print("TP data path from central log: ",File_path)
+
+
+if(cpgn_type=='loyalty'):
+	File_path="s3://big-data-analytics-scratch-prod/project_traveler_profile/affine/email_campaign_test/ETL/Data/CER_MER"
+	#File_path = detailed_log_list['FilePath']
+else:
+	File_path = detailed_log_list['FilePath']
+print("TP data path from central log:",File_path)
 
 try:
 	log_df_update(sqlContext,1,'Reading TP file path from central log',get_pst_date(),' ','0',StartDate,File_path,AlphaProcessDetailsLog_str)
@@ -413,68 +486,6 @@ else :
 	log_df_update(sqlContext,1,'Populating var source in module var definition',get_pst_date()," ",str(log_rowcount),StartDate,' ',AlphaProcessDetailsLog_str)
 
 StartDate = get_pst_date()
-### creating meta campaign data by combining all the raw files 
-dfMetaCampaignData1 = (dfCampaignDefinition
-									 .filter("locale = '{}' and LaunchDate = '{}'".format(locale_name,LaunchDate)).withColumn("locale",lower_locale_udf("locale"))
-									.filter(pos_filter_cond).filter("campaign_deleted_flag = 0"))
-
-
-if job_type == 'test':									
-	if test_type == 'MANUAL':
-		campaign_id_filter="campaign_id="+str(campaign_id)
-		dfMetaCampaignData1=dfMetaCampaignData1.filter(campaign_id_filter)      #filtering dfMetaCampaignData1 on the basis of campaign id parameter
-		
-		if dfMetaCampaignData1.count() <= 0 :
-		    condition_str2 = 'Campaign id {} entered for locale {} on {} does not exist'.format(campaign_id,locale_name,LaunchDate)
-		    log_df_update(sqlContext,0,condition_str2,get_pst_date(),'','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
-		    log_df_update(sqlContext,0,condition_str2,get_pst_date(),'','0',AlphaStartDate,' ',CentralLog_str)
-		    print (condition_str2)
-		    #sys.exit()
-			
-dfMetaCampaignData2 = (dfMetaCampaignData1.join(dfTemplateDefinition.filter("template_deleted_flag = 0"),'template_id','inner')
-																		 .join(dfSegmentModule.filter("seg_mod_deleted_flag = 0"),'segment_module_map_id','inner')
-																		 .join(dfModuleDefinition,['locale','module_type_id','tpid','eapid','placement_type','channel'],'inner')                      
-																		 .join(dfSegmentDefinition.filter("segment_deleted_flag = 0"),["tpid","eapid","segment_type_id"],'inner')).filter("status != 'archived'")
-
-#Change 1: We need the status column identify modules that are test published
-dfMetaCampaignData_31 = (dfMetaCampaignData2.select([c for c in dfMetaCampaignData2.columns if c not in
-																			 {"campaign_type_id","dayofweek","program_type",
-																			"derived_module_id","context","language","lob_intent"}])
-										.withColumn("locale",lower_locale_udf("locale"))
-										.filter(pos_filter_cond))
-
-
-###Checking if all the modules in dfMetaCampaignData_31 are present in dfModuleVariableDefinition
-
-StartDate = get_pst_date()										
-list_modules_31=dfMetaCampaignData_31.select('module_id').distinct().rdd.flatMap(lambda x: x).collect()
-list_modules_modvardef=dfModuleVariableDefinition.select('module_id').distinct().rdd.flatMap(lambda x: x).collect()
-
-mod_intersect=set(list_modules_31).intersection(set(list_modules_modvardef))
-mod_notPresent_list=list(set(list_modules_31)-mod_intersect)
-mod_notPresent_list
-
-if(len(mod_notPresent_list)!=0):
-	print("Some modules not present")
-	log_df_update(sqlContext,0,'Failed',get_pst_date(),'Some modules not present in module_variable_definition','0',StartDate,' ',AlphaProcessDetailsLog_str)
-	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
-	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
-	code_completion_email("failed as some modules were not present in module_variable_definition","Alpha process update for "+locale_name,pos,locale_name)
-	raise Exception("modules not present: ",mod_notPresent_list)
-
-else:
-	log_df_update(sqlContext,1,'Missing modules check',get_pst_date(),'','0',StartDate,' ',AlphaProcessDetailsLog_str) 
-
-if (dfMetaCampaignData_31.count()) <= 0 :
-	condition_str = 'check campaign is present for locale {} and launch date {}'.format(locale_name,LaunchDate)
-	log_df_update(sqlContext,0,'Campaign meta data created',get_pst_date(),condition_str,'0',StartDate,' ',AlphaProcessDetailsLog_str)
-	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
-	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
-	raise Exception(condition_str)
-else :
-	log_df_update(sqlContext,1,'Campaign meta data created',get_pst_date()," ",'0',StartDate,' ',AlphaProcessDetailsLog_str)
-
-print("------------Campaign meta data created")
 
 StartDate = get_pst_date()
 try:
@@ -518,13 +529,154 @@ for sample_data_path in sampled_data_paths:
 		
 
 if(len(sampled_data_paths) == 0):
-	final_df = sqlContext.read.parquet("s3://occ-decisionengine/config_file_test_set_up/test_builder_output_09202017_final").filter("test_id = 908977") # To preserve schema
+	final_df = sqlContext.read.parquet("s3://occ-decisionengine/config_file_test_set_up/test_builder_output_09202017_final").filter("test_id = -1") # To preserve schema
+
+finaldfModuleType = final_df.filter("test_type = 'module type'")
+
+
+def obtainSamplingForModuleType():
+	return(finaldfModuleType)
+
+
+moduleTypeTestFlag = 0
+	
+def moduleTypeTest():
+	
+	dfMetaCampaignData1 = (dfCampaignDefinition
+										 .filter("locale = '{}' and LaunchDate = '{}'".format(locale_name,LaunchDate)).withColumn("locale",lower_locale_udf("locale"))
+										.filter(pos_filter_cond).filter("campaign_deleted_flag = 0"))                                   
+	dfMetaCampaignData2 = (dfMetaCampaignData1.join(dfTemplateDefinition.filter("template_deleted_flag = 0"),'template_id','inner')
+																			 .join(dfSegmentModule.filter("seg_mod_deleted_flag = 0"),'segment_module_map_id','inner')
+	)
+	test_lookup_final = obtainSamplingForModuleType()
+	if(test_lookup_final.count() == 0):
+		print("No Module Type Tests for this locale")
+		log_df_update(sqlContext,1,'No Active Module Type tests on the given locale',get_pst_date(),'','0',StartDate,' ',AlphaProcessDetailsLog_str)
+		moduleTypeTestFlag = 0
+		return dfTemplateDefinition
+	controlSegmentModuleMapIDs = test_lookup_final.filter("Control_Test_Flag = 0").select("segment_module_map_id").distinct().rdd.flatMap(lambda x:x).collect() #List of segment module map IDs that belong to control
+	segmentsUnderTest = test_lookup_final.select("segment_type_id").distinct().rdd.flatMap(lambda x:x).collect() # list of segments that have a test running on them
+	campaignsForTest = dfMetaCampaignData2.filter(dfMetaCampaignData2.segment_module_map_id.isin(controlSegmentModuleMapIDs)).select("campaign_id").distinct().rdd.flatMap(lambda x:x).collect()
+	treatmentModuleList = test_lookup_final.select("module_type_id").distinct().rdd.flatMap(lambda x:x).collect() #A list of all module types that appear for all active tests. Includes both treatment and control 
+	segmentsUnderTest = [str(i) for i in segmentsUnderTest]
+	print(campaignsForTest)
+	if(len(campaignsForTest) == 0):
+		moduleTypeTestFlag = 0
+		print("No module type tests running for the campaigns launching today")
+		log_df_update(sqlContext,1,'No Active Module Type tests on the given campaign',get_pst_date(),'','0',StartDate,' ',AlphaProcessDetailsLog_str)
+		return dfTemplateDefinition
+	else:
+		moduleTypeTestFlag = 1
+		print("Module type tests running")
+		log_df_update(sqlContext,1,'Active Module Type tests on campaigns on' + ",".join(campaignsForTest),get_pst_date(),'','0',StartDate,' ',AlphaProcessDetailsLog_str)
+	if(moduleTypeTestFlag == 1):
+	#Getting segment module map ID of the control group
+		distinctTests = test_lookup_final.filter("Control_Test_Flag = 0").select("test_id").distinct().rdd.flatMap(lambda x:x).collect()
+		update_table = dfTemplateDefinition.filter("slot_position = -1") #This is an empty table with schema that matches the template definition table
+		for test in distinctTests : 
+			control_moduleType_list = test_lookup_final.filter("Control_Test_Flag = 0").filter(test_lookup_final.test_id == test).select("module_type_id").distinct().rdd.flatMap(lambda x:x).collect()
+			treatment_segmentModuleMapID_list = test_lookup_final.filter("Control_Test_Flag != 0").filter(test_lookup_final.test_id == test).select("segment_module_map_id").distinct().rdd.flatMap(lambda x:x).collect()
+			templateDefinitionControl = dfMetaCampaignData2.filter(dfMetaCampaignData2.module_type_id.isin(control_moduleType_list)).select(dfTemplateDefinition.columns) #Copies the row from template definiton table for the control module type that belongs to a given test
+			for segmentModuleMapID in treatment_segmentModuleMapID_list:
+				temporaryTemplateTable = templateDefinitionControl.withColumn("segment_module_map_id",lit(segmentModuleMapID)) #Only changing the segment module map ID for the row obtained above
+				update_table = update_table.union(temporaryTemplateTable)
+		if(moduleTypeTestFlag == 1):
+			dfTemplateDefinitionTemp = dfTemplateDefinition.unionAll(update_table)
+		update_table.show(10,False)
+		return dfTemplateDefinitionTemp
+
+dfTemplateDefinition = moduleTypeTest()
+
+
+
+### creating meta campaign data by combining all the raw files 
+dfMetaCampaignData1 = (dfCampaignDefinition
+									 .filter("locale = '{}' and LaunchDate = '{}'".format(locale_name,LaunchDate)).withColumn("locale",lower_locale_udf("locale"))
+									.filter(pos_filter_cond).filter("campaign_deleted_flag = 0"))
+
+
+if job_type == 'test':									
+	if test_type == 'MANUAL':
+		campaign_id_filter="campaign_id="+str(campaign_id)
+		dfMetaCampaignData1=dfMetaCampaignData1.filter(campaign_id_filter)      #filtering dfMetaCampaignData1 on the basis of campaign id parameter
+		
+		if dfMetaCampaignData1.count() <= 0 :
+		    condition_str2 = 'Campaign id {} entered for locale {} on {} does not exist'.format(campaign_id,locale_name,LaunchDate)
+		    log_df_update(sqlContext,0,condition_str2,get_pst_date(),'','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
+		    log_df_update(sqlContext,0,condition_str2,get_pst_date(),'','0',AlphaStartDate,' ',CentralLog_str)
+		    print (condition_str2)
+		    #sys.exit()
+			
+dfMetaCampaignData2 = (dfMetaCampaignData1.join(dfTemplateDefinition.filter("template_deleted_flag = 0"),'template_id','inner')
+																		 .join(dfSegmentModule.filter("seg_mod_deleted_flag = 0"),'segment_module_map_id','inner')
+																		 .join(dfModuleDefinition,['locale','module_type_id','tpid','eapid','placement_type','channel'],'inner')
+																		 .join(dfSegmentDefinition.filter("segment_deleted_flag = 0"),["tpid","eapid","segment_type_id"],'inner')).filter("status in ('test published','active published')")
+
+#Change 1: We need the status column identify modules that are test published
+dfMetaCampaignData_31 = (dfMetaCampaignData2.select([c for c in dfMetaCampaignData2.columns if c not in
+																			 {"campaign_type_id","dayofweek","program_type",
+																			"derived_module_id","context","language","lob_intent"}])
+										.withColumn("locale",lower_locale_udf("locale"))
+										.filter(pos_filter_cond))
+
+###Checking if all the modules in dfMetaCampaignData_31 are present in dfModuleVariableDefinition
+
+StartDate = get_pst_date()                                      
+modules_present_in_campaign=dfMetaCampaignData_31.select('module_id').distinct().rdd.flatMap(lambda x: x).collect()
+modules_present_in_vardef=dfModuleVariableDefinition.select('module_id').distinct().rdd.flatMap(lambda x: x).collect()
+
+mods_notPresent=list(set(modules_present_in_campaign)-set(modules_present_in_vardef))
+
+
+if(len(mods_notPresent)!=0):
+    print("Some modules not present")
+    log_df_update(sqlContext,0,'Failed',get_pst_date(),'Some modules not present in module_variable_definition','0',StartDate,' ',AlphaProcessDetailsLog_str)
+    log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
+    log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
+    code_completion_email("failed as some modules were not present in module_variable_definition","Alpha process update for "+locale_name,pos,locale_name)
+    raise Exception("modules not present: ",mods_notPresent)
+
+else:
+    log_df_update(sqlContext,1,'Missing modules check',get_pst_date(),'','0',StartDate,' ',AlphaProcessDetailsLog_str) 
+
+
+if (dfMetaCampaignData_31.count()) <= 0 :
+	condition_str = 'check campaign is present for locale {} and launch date {}'.format(locale_name,LaunchDate)
+	log_df_update(sqlContext,0,'Campaign meta data created',get_pst_date(),condition_str,'0',StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
+	raise Exception(condition_str)
+else :
+	log_df_update(sqlContext,1,'Campaign meta data created',get_pst_date()," ",'0',StartDate,' ',AlphaProcessDetailsLog_str)
+
+print("------------Campaign meta data created")
+
+#Creating Dictionaries for module type test
+def moduleTypeTestCreateDict():
+    test_lookup_final = obtainSamplingForModuleType()
+    controlSegmentModuleMapIDs = test_lookup_final.filter("Control_Test_Flag = 0").select("segment_module_map_id").distinct().rdd.flatMap(lambda x:x).collect()
+    segmentsUnderTest = test_lookup_final.select("segment_type_id").distinct().rdd.flatMap(lambda x:x).collect()
+    treatmentModuleList = test_lookup_final.select("module_type_id").distinct().rdd.flatMap(lambda x:x).collect()
+    segmentsUnderTest = [str(i) for i in segmentsUnderTest]
+    #TestKeyModuleDict basically tells us the module being assigned to a given test key for a given segment. It has the formant test_keys#segmenttypeID : [moduleTypeID] . Note that the values are present in a list format. This is because there can be multiple tests running on the same segment
+    #segmentTypeControlDict is a dictionary that tells us the control module type for each segment. This dictionary is now redundant. 
+    testKeyPandas = test_lookup_final.select("test_keys","module_type_id","segment_type_id").withColumn("moduleTypeKey",concat(col("test_keys"),lit("#"),col("segment_type_id"))).groupby("moduleTypeKey").agg(F.collect_set("module_type_id").alias("module_type_id")).toPandas()
+    testKeyPandas.index = testKeyPandas['moduleTypeKey']
+    TestKeyModuleDict = testKeyPandas.to_dict()['module_type_id']
+    segmentTypeControlPandas = test_lookup_final.filter("Control_Test_Flag = 0").select("module_type_id","segment_type_id").distinct().toPandas()
+    segmentTypeControlPandas.index = segmentTypeControlPandas['segment_type_id']
+    segmentTypeControlDict = segmentTypeControlPandas.to_dict()['module_type_id']
+    return TestKeyModuleDict,segmentTypeControlDict,segmentsUnderTest,campaignsForTest,treatmentModuleList
+
+if(moduleTypeTestFlag == 1):
+	TestKeyModuleDict,segmentTypeControlDict,segmentsUnderTest,campaignsForTest,treatmentModuleList = moduleTypeTestCreateDict()
 
 #Algo to find the mapping between test id and corresponding campaign type
 #Step 1: Filter meta_campaign_31 to obtain the list of test published modules
 #Step 2: Join this with the sampled output
 #Step 3: Convert that to pandas and obtain a mapping of test id to campaign id
 
+final_df = final_df.filter("test_type = 'module version'")
 test_module_table = dfMetaCampaignData_31.filter("status = 'test published'")
 test_module_table_filtered = test_module_table.select(col("campaign_id").alias("campaign_look_up_id"),"module_id","placement_type","slot_position","campaign_segment_type_id").distinct()
 final_df_updated = final_df.join(test_module_table_filtered,["module_id"],"left")
@@ -705,9 +857,14 @@ tp_cols = list(set(reqd_cols + joining_cols_final + content_cols_final))
 
 print("Columns required from TP data: ", tp_cols)
 
-dfTraveler_before_suppression = (sqlContext.read.parquet(File_path).select(tp_cols).filter("mer_status = 1").withColumn("locale",lower_locale_udf("locale")))
-dfTraveler = suppressCustomersBasedOnBusinessRules(dfTraveler_before_suppression).cache()
-dfTravelers = (dfTraveler.repartition(rep).cache())
+
+if(cpgn_type=='loyalty'):
+	dfTraveler_before_suppression = (sqlContext.read.parquet(File_path).filter("locale='{}'".format(locale_name)).select(tp_cols).withColumn("locale",lower_locale_udf("locale")))
+	dfTravelers = (dfTraveler_before_suppression.repartition(rep).cache()) #Business suppression not done for loyalty
+else:
+	dfTraveler_before_suppression = (sqlContext.read.parquet(File_path).select(tp_cols).filter("mer_status = 1").withColumn("locale",lower_locale_udf("locale")))
+	dfTraveler = suppressCustomersBasedOnBusinessRules(dfTraveler_before_suppression).cache()
+	dfTravelers = (dfTraveler.repartition(rep).cache())
 
 log_df_update(sqlContext,1,'TP data imported with {} columns'.format(len(tp_cols)),get_pst_date(),'','0',StartDate,File_path,AlphaProcessDetailsLog_str)
 print("------------TP data imported with {} columns".format(len(tp_cols)))
@@ -715,7 +872,11 @@ print("------------TP data imported with {} columns".format(len(tp_cols)))
 ### importing traveler-segment mapped data
 StartDate = get_pst_date()
 
-seg_clt1 = central_log_table.filter(central_log_table.SourceID == process_id).filter(central_log_table.IsComplete == 1).filter(central_log_table.SourceName == "Segment_mapping").orderBy(desc('EndDate'))
+if(cpgn_type=='loyalty'):
+    seg_clt1 = central_log_table.filter(central_log_table.SourceID == process_id).filter(central_log_table.IsComplete == 1).filter(central_log_table.SourceName == "Segment_mapping_loyalty").orderBy(desc('EndDate'))
+else:
+    seg_clt1 = central_log_table.filter(central_log_table.SourceID == process_id).filter(central_log_table.IsComplete == 1).filter(central_log_table.SourceName == "Segment_mapping").orderBy(desc('EndDate'))
+	
 seg_detailed_log_list = seg_clt1.collect()[0] 
 #print (seg_detailed_log_list)
 seg_log_id = seg_detailed_log_list['LogID']
@@ -751,6 +912,21 @@ dfTraveler_MetaCampaign = (traveler.withColumnRenamed("segment_type_id","campaig
 											.withColumnRenamed("segment_type_id_concat","segment_type_id")
 											.drop("")
 											 .distinct())
+
+if dfTraveler_MetaCampaign.count() == 0 :
+	error_msg = "No traveler segments mapped for campaign Metadata for {} on LaunchDate: {} Error Code: 1001".format(locale_name, LaunchDate)
+	log_df_update(sqlContext,0, error_msg, get_pst_date(),'','0',AlphaStartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0, error_msg, get_pst_date(),'','0',AlphaStartDate,' ',CentralLog_str)
+	
+	code_completion_email("No traveler segments mapped for campaign Metadata for {} on LaunchDate: {}. Error Code: 1001 ".format(locale_name, LaunchDate),"Alpha process update for "+locale_name,pos,locale_name)
+	print (error_msg)
+	#clear_running_table(locale_name)
+	#import sys
+	sys.exit()
+else :
+	log_df_update(sqlContext,1,'Travelers present for campaign for {} on {}'.format(locale_name,LaunchDate),get_pst_date(),'','0',StartDate,' ',AlphaProcessDetailsLog_str)
+
+
 
 for_alpha = (dfTraveler_MetaCampaign
 												.join(dfTravelers,['email_address',"test_keys","tpid","eapid","locale"],'inner')
@@ -826,9 +1002,8 @@ mis_data_df = (dfMetaCampaignData_VarDef_backup
 						.filter("var_source is not null")
 						.select("module_id","var_position","var_source","var_structure").distinct())
 
-mis_data_df.cache()
 
-### function to extract joining key of   table
+### function to extract joining key of MIS table
 def extract_keys(var_source):
 	temp1 = var_source.split("|")
 	if len(temp1) > 1:
@@ -879,6 +1054,8 @@ mis_data_intermediate = (mis_data_df.withColumn("file_name",file_name_udf("var_s
 ### Using the key in keys column the file_name will be joined to traveler data and the data from columns belonging to mis_cols will be fetched
 
 mis_data_file_names = mis_data_intermediate.select("file_name").distinct().rdd.map(lambda x: str(x[0])).collect() #finding out the file names
+config_loyalty_file_name = [x for x in mis_data_file_names if x=='config_loyalty' ]
+mis_data_file_names=[x for x in mis_data_file_names if x!='config_loyalty']
 mis_data_rdd =mis_data_intermediate.rdd.collect() #converting mis_data_intermediate to rdd
 
 
@@ -887,12 +1064,22 @@ print("------------creating MIS RDD")
 ### function to read MIS table from sql server
 mis_content_dict = {}
 mis_data_rdd_dic = {}
+
+config_loyalty_data_rdd_dic={}
+def readAllconfigloyaltyFiles(file_names_loyalty):
+	for file_name in file_names_loyalty:
+			 file = importSQLTable(ocelotDb,file_name)
+			 file = file.filter(pos_filter_cond)
+			 file.cache()
+			 config_loyalty_data_rdd_dic[file_name]=file #prints the schema, behaves as a pointer. doesn't store it in memory until this dictionary is used somewhere
+
 def readAllMisFiles(file_names):
 	for file_name in file_names:
 			 file = importSQLTable("AlphaMVP",file_name)
 			 file = file.filter(pos_filter_cond)
 			 file.cache()
 			 mis_data_rdd_dic[file_name]=file #prints the schema, behaves as a pointer. doesn't store it in memory until this dictionary is used somewhere
+
 
 
 ### mis_data_rdd_dic is a dictionary with key as the filename and value as the schema. It acts as a pointer to that file
@@ -902,6 +1089,8 @@ def readAllMisFiles(file_names):
 
 try:
 	readAllMisFiles(mis_data_file_names)
+	readAllconfigloyaltyFiles(config_loyalty_file_name)
+
 	log_df_update(sqlContext,1,'MIS data imported',get_pst_date(),' ','0',StartDate,' ',AlphaProcessDetailsLog_str)
 
 except:
@@ -912,6 +1101,9 @@ except:
 	raise Exception("MIS data not present!!!")
 
 print("------------Reading MIS data")
+
+
+mis_data_rdd_dic.update(config_loyalty_data_rdd_dic)
 ### creating dictionary of MIS data 
 
 StartDate = get_pst_date()
@@ -1080,6 +1272,61 @@ else :
 
 StartDate = get_pst_date()
 
+
+def moduleTypeModifier(campaign_id,test_keys,segment_type_id,campaign_segment_type_id,map_dict1):
+	#Checking if a person is eligible for tests
+	## Through this function, beware of key not found errors. Especially for TestKeyModuleDict. I do not see why the key would be missing, but it is good to have a check just in case  
+	removeAllTreatment = 0 # Un-used currently. Will be useful if a bug arises whose fix is to remove all treatment module types allcolated
+	campaignNotEligible = 0 #Part of the safety net
+	segmentNotEligible = 0 #Part of the safety net
+	preserveModuleList = [] #Will be populated with the set of module types that should not be deleted for a traveler 
+	removalList = set(treatmentModuleList) #Initially, we will assume that all modules introduced  as per the tests will be removed
+	segmentIDList = segment_type_id.split("#") #List of all the segments a traveler would be eligible for
+	activeSegmentsTraveler = set(segmentIDList).intersection(set(segmentsUnderTest)) #intersection of list of segments that the tests target and travelers eligible segments 
+	if(campaign_id not in campaignsForTest):
+		removeAllTreatment = 1 #Unused. Might be useful in case any bugs arise
+		campaignNotEligible = 1 #Unused. Might be useful in case any bugs arise
+
+	if(len(activeSegmentsTraveler) == 0):
+		removeAllTreatment = 1 #Unused. Might be useful in case any bugs arise
+		segmentNotEligible = 1 #Unused. Might be useful in case any bugs arise
+		
+	moduleTypeCounter = 0 #Unused
+	for segmentTypeID in activeSegmentsTraveler:
+		moduleKey = str(test_keys) + "#" +str(segmentTypeID) #Creating a key for each Traveler. This key will be used to track the module types allocated to him/her as per the tests
+		for moduleTypeTemp in TestKeyModuleDict[moduleKey] :
+			preserveModuleList.append(moduleTypeTemp) #If tests are designed on multiple segment type ID's, there will be multiple preserve modules
+		removalList = (removalList - set(preserveModuleList)) #Has the list of modules that needs to be removed for the given traveler
+		moduleTypeCounter = moduleTypeCounter + 1 #Unused
+		#segmentTypeControlDict
+		
+	new_dict = {} #Will contain the new dictionary after removing the extra module types. This will be at a slot level
+	removalList = [str(i) for i in removalList]
+	for slot in map_dict1:
+		moduleAllocationDict = map_dict1[slot] #Obtaining the original allocation
+		moduleDict = {} #Will contain populated dictionaries for each slot. Hence, it is refreshed to 0 for each slot 
+		for moduleTypePrio in moduleAllocationDict:
+			moduleType = moduleTypePrio.split("#")[0]
+			if moduleType not in removalList: #Will populate moduleDict only if the given module type is not in the blacklist for this traveler. Hence, removing extra module types 
+				moduleDict[moduleTypePrio] = moduleAllocationDict[moduleTypePrio]
+		new_dict[slot] = moduleDict #Updating the dictionary for the given slot
+		
+	#Fall back situation. This is when the new dictionary has zero entries. This happens if there are unequal placement types between control and treatment
+	slotClearList = []
+	for slot in new_dict:
+		newmoduleAllocationDict = new_dict[slot]
+		moduleDict = {}
+		priorityList = []
+		slotRefreshFlag = 0
+		if len(newmoduleAllocationDict) == 0 : #In the event where a slot has zero module types, We will repopulate it with control 
+			new_dict[slot] = map_dict1[slot]
+	return(new_dict)
+
+
+moduleTypeModifierUdf = udf(moduleTypeModifier,MapType(StringType(),MapType(StringType(),StringType())))
+
+
+
 def module_allocation_modifier(campaign_id,test_keys,campaign_segment_type_id,map_dict1,segment_type_id,test_segments):
 	key_version = test_keys+"#"+campaign_segment_type_id+"#"+campaign_id
 	try:
@@ -1137,6 +1384,12 @@ def module_allocation_modifier(campaign_id,test_keys,campaign_segment_type_id,ma
 	
 module_allocation_modifier_udf = udf(module_allocation_modifier,MapType(StringType(),MapType(StringType(),StringType())))
 
+if(moduleTypeTestFlag == 1):
+	df_slot_fun_new = df_slot_fun.withColumn("new_dict",moduleTypeModifierUdf("campaign_id","test_keys","segment_type_id","campaign_segment_type_id","map_dict1"))
+	print("------------Module type test detected. Now removing extra module types")
+	df_slot_fun_new = df_slot_fun_new.drop("map_dict1")
+	df_slot_fun_new = df_slot_fun_new.withColumnRenamed("new_dict","map_dict1")
+	df_slot_fun = df_slot_fun_new
 
 if(module_version_test_flag == True):
 	print("------------Module version test detected. Now replacing modules wherever possible")
@@ -1368,7 +1621,7 @@ def content_map(row):
 					placement_type_mp = suppress_dict['placement_type'][int(x_dict['S'+slot_position+'_module_id'])]
 					default_flag_mp = suppress_dict['default'][int(x_dict['S'+slot_position+'_module_id'])]
 
-					if ((x.lower().find('value_not_found') >= 0) or (x.lower().find('none') >= 0) or (x.lower().find('nan') >= 0) or (x.lower().find('null') >= 0) ):
+					if ((x.lower().find('value_not_found') >= 0) or (x.lower().find('none') >= 0 and len(x) == 4) or (x.lower().find('nan') >= 0) or (x.lower().find('null') >= 0) ):
 						if ( slot_var_pos == "S1_P1"):
 							x_dict[slot_var_pos] = x_total.split('|')[0]	   #for att 'default' it has been changed to 'None'
 						else:
@@ -1978,6 +2231,17 @@ if job_type == 'test':
 		code_completion_email("failed due to error in email address change","Alpha process update for "+locale_name,pos,locale_name)
 		raise Exception("Error in Email address change!!!")   
 
+try:
+	if env_type == 'test' and test_type not in ('AUTOTEST','MANUAL'):
+		blackholeEmail = 'username@blackhole.messagegears.com'
+		final_result_moduleCount=final_result_moduleCount.withColumn('EmailAddress',lit(blackholeEmail))
+		log_df_update(sqlContext,1,'Email addresses changed to blackhole address for Test Environment',get_pst_date(),' ',log_rowcount,StartDate,' ',AlphaProcessDetailsLog_str) 
+except:
+	log_df_update(sqlContext,1,'Error in Email address change to blackhole address for Test Environment',get_pst_date(),'Error',log_rowcount,StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
+	code_completion_email("failed due to error in email address change to blackhole address for Test Environment","Alpha process update for "+locale_name,pos,locale_name)
+	raise Exception("Error in Email address change!!!")  
 
 StartDate = get_pst_date()
 
@@ -2119,15 +2383,47 @@ df22 = sqlContext.createDataFrame(pd.DataFrame(list2_concat)).withColumnRenamed(
 df12 = df11.unionAll(df22)
 #df12.show(100, False)
 
-if env_type == "prod":
-	jobMappingTable = "AlphaJobMappingProd"
+launchServiceDf = importSQLTable(ocelotDb, "launchServiceLocalesEnabled")
+
+# no need to fail if no locales just go old way
+if (launchServiceDf.count() != 0):
+	launchServiceLocales = launchServiceDf.select("locale").rdd.map(lambda x: str(x[0]).lower()).collect()
 else:
-	jobMappingTable = "AlphaJobMappingTest"
+	log_df_update(sqlContext,1,'there are no launch service locales available',get_pst_date(),'Error',log_rowcount,StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
+	launchServiceLocales = []
 
-cpn_schedule = importSQLTable("OcelotStaging",jobMappingTable).filter("Locale = '{}' ".format(locale_name)).select("AlphaCampaignID","ScheduledLaunchTime")
 
-rdd_path = df12.join(cpn_schedule.withColumnRenamed("AlphaCampaignID","campaign_id"),"campaign_id","inner").sort("ScheduledLaunchTime","staging_filename")
-rdd_path.show(100, False)
+if any(locale_name in x for x in launchServiceLocales):
+	print("locale {} is using new launch service change".format(locale_name))
+	cpn_schedule = (importSQLTable(ocelotDb, "tblCampaignLaunchDetails").filter("locale = '{}' and launchDate = '{}' ".format(locale_name,LaunchDate))
+		.select("CampaignID","scheduledLaunchTime")
+		.withColumnRenamed("CampaignID","campaign_id")
+	)
+else:
+	if env_type == "prod":
+		jobMappingTable = "AlphaJobMappingProd"
+	else:
+		jobMappingTable = "AlphaJobMappingTest"
+
+	cpn_schedule = (importSQLTable("OcelotStaging", jobMappingTable).filter("locale = '{}' ".format(locale_name))
+		.select("AlphaCampaignID","ScheduledLaunchTime")
+		.withColumnRenamed("AlphaCampaignID","campaign_id")
+		.withColumnRenamed("ScheduledLaunchTime","scheduledLaunchTime")
+	)
+
+
+## if schedule doesn't exist fail. 
+if (cpn_schedule.count() != 0):
+	rdd_path = df12.join(cpn_schedule,"campaign_id","inner").sort("scheduledLaunchTime","staging_filename")
+else:
+	log_df_update(sqlContext,1,'could not find any schedule for campaigns',get_pst_date(),'Error',log_rowcount,StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',StartDate,' ',AlphaProcessDetailsLog_str)
+	log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
+	code_completion_email("failed due to error during wrtite to s3. Could not find any schedule for campaigns in locale: "+locale_name,pos,locale_name)
+	raise Exception("Could not find any schedule for campaigns!!!")  
+
 
 #writing the path of the staging files for S3-to-SQL writer to read from
 if job_type == "prod":
