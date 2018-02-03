@@ -149,7 +149,7 @@ try :
     parser.add_argument("--test_type", help="AUTOTEST or MANUAL or BACKUP OR XYZ")
     parser.add_argument("--campaign_id", help="Campaign ID or Null")
     parser.add_argument("--email_address", help="Enter email address")
-#    parser.add_argument("--GITVER", help="Enter git version to use")
+ #   parser.add_argument("--GITVER", help="Enter git version to use")
 
     args = parser.parse_args()
     locale_name = args.locale_name
@@ -158,7 +158,7 @@ try :
     cpgn_type = args.cpgn_type
     run_date = args.run_date
     test_type = args.test_type
-#    GITVER = args.GITVER
+ #   GITVER = args.GITVER
 #   locale_name = 'en_nz'
 #   job_type = 'test'
 #   env_type = 'prod'
@@ -261,7 +261,6 @@ print("LaunchDate = " + str(LaunchDate))
 
 #print("Central log: ", CentralLog_str)
 #print("Alpha details log: ", AlphaProcessDetailsLog_str)
-
 def BuildPath(env_type,job_type,test_type,LaunchDate,locale_name,cpgn_type):
     path_dict = {}
     for path in ['OcelotDataProcessing_Output','Mis_Output','TP_Output','User_Token_Output','RecipientID_Output',]:
@@ -271,7 +270,6 @@ def BuildPath(env_type,job_type,test_type,LaunchDate,locale_name,cpgn_type):
         else:
             path_dict[path] = "s3://occ-decisionengine/AlphaModularization/Environment_{}/Job_{}/{}/{}/{}/{}/".format(env_type,job_type,LaunchDate,locale_name,cpgn_type,path)
     return path_dict
-
 path_dict = BuildPath(env_type,job_type,test_type,LaunchDate,locale_name,cpgn_type)
 print("created dictionary of paths")
 
@@ -753,8 +751,6 @@ def content_map(row):
     dynamic_content_value = {}
 
     for slot_position in slot_list:
-        
-        
         dynamic_content_for_slot = {}
         map_dict1 = row['map_dict1'][str(slot_position)]  #moduletypeid##priority->moduleid
         slot_position = str(slot_position)
@@ -835,7 +831,7 @@ def content_map(row):
                                 travel_data = "".join([str(row[i]) for i in left_keys ])  #Gets the data from the columns mentioned in left_keys
                                 mod_id_map = x_dict['S'+slot_position+'_module_id']  #module id
                                 try :
-                                    value_re = mis_content_dict[str(mod_id_map)+df_name.lower()+''.join(right_keys)+var_pos][temp.split('.')[1]][travel_data]
+                                    value_re = mis_content_dict[str(mod_id_map)+df_name+''.join(right_keys)+var_pos][temp.split('.')[1]][travel_data]
                                 #value_re contains the data/value. It first accesses the dictionary, finds the column and obtains the data for the column
                                 except : value_re = ''
                                 if value_re == '':
@@ -1367,7 +1363,7 @@ except:
 
 
 
-def sampling():
+def sampling(final_result_moduleCount):
 
     StartDate = get_pst_date()
     ###Sampling 5 rows for each omni extension
@@ -1389,7 +1385,7 @@ def sampling():
         
         try:
             if test_type in ('AUTOTEST','MANUAL'):
-                final_result_moduleCount=final_result_moduleCount.withColumn('EmailAddress',lit(email_address))
+                final_result_moduleCount=final_result_moduleCount.withColumn('email_address',lit(email_address))
                 log_df_update(sqlContext,1,'Email addresses changed',get_pst_date(),' ',rec_cnt,StartDate,' ',AlphaProcessDetailsLog_str) 
             
         except:
@@ -1398,7 +1394,9 @@ def sampling():
             log_df_update(sqlContext,0,failure_str,get_pst_date(),'Error','0',AlphaStartDate,' ',CentralLog_str)
             code_completion_email("failed due to error in email address change","Alpha process update for "+locale_name,pos,locale_name)
             raise Exception("Error in Email address change!!!")   
+    return final_result_moduleCount
 
+final_result_moduleCount=sampling(final_result_moduleCount)
             
 
 def WriteToS3(final_result_moduleCount):
